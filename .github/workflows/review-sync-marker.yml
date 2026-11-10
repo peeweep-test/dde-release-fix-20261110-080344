@@ -1,4 +1,4 @@
-# template revision 1
+# template revision 3
 name: Inert sync marker
 on: workflow_dispatch
 jobs:
