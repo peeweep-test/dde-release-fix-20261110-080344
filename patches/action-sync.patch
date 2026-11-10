@@ -93,7 +93,7 @@ index 7d6aa0b..18756ff 100644
 +        fi
 +        "$GITHUB_ACTION_PATH/action-sync" -files="$files" -message="$INPUT_MESSAGE" -pull-request="$INPUT_PULL_REQUEST"
 diff --git a/main.go b/main.go
-index d7166a3..effe7d4 100644
+index d7166a3..80ed867 100644
 --- a/main.go
 +++ b/main.go
 @@ -3,6 +3,7 @@ package main
@@ -179,7 +179,7 @@ index d7166a3..effe7d4 100644
  				}
  			}
  		}
-@@ -181,6 +198,35 @@ func main() {
+@@ -181,6 +198,36 @@ func main() {
  	}
  }
  
@@ -187,7 +187,8 @@ index d7166a3..effe7d4 100644
 +	repo := filepath.Base(filepath.Dir(workdir)) + "/" + filepath.Base(workdir)
 +	branch := pullRequestBranchPrefix + base
 +	url, err := execCommand(ctx, workdir, "gh", "pr", "list", "--repo", repo,
-+		"--head", branch, "--base", base, "--state", "open", "--json", "url", "--jq", ".[0].url // empty")
++		"--head", branch, "--base", base, "--state", "open", "--json", "url,isCrossRepository",
++		"--jq", "map(select(.isCrossRepository == false))[0].url // empty")
 +	if err != nil {
 +		return err
 +	}

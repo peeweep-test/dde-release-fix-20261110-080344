@@ -202,7 +202,8 @@ func syncPullRequest(ctx context.Context, workdir, base, message string) error {
 	repo := filepath.Base(filepath.Dir(workdir)) + "/" + filepath.Base(workdir)
 	branch := pullRequestBranchPrefix + base
 	url, err := execCommand(ctx, workdir, "gh", "pr", "list", "--repo", repo,
-		"--head", branch, "--base", base, "--state", "open", "--json", "url", "--jq", ".[0].url // empty")
+		"--head", branch, "--base", base, "--state", "open", "--json", "url,isCrossRepository",
+		"--jq", "map(select(.isCrossRepository == false))[0].url // empty")
 	if err != nil {
 		return err
 	}
