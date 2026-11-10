@@ -1,0 +1,6 @@
+groups:
+  G5:
+    name: Isolated regression fixture
+    version: 1.0.0
+    members:
+    - dde-release-fix-20261110-080344

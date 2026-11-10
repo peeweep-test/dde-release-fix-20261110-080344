@@ -1,0 +1,217 @@
+diff --git a/README.md b/README.md
+index 340d714..a3f17e2 100644
+--- a/README.md
++++ b/README.md
+@@ -16,8 +16,39 @@ inputs:
+     description: "commit message"
+     required: false
+     default: "chore: Sync by .github"
++  pull-request:
++    description: "通过 PR 更新目标分支"
++    required: false
++    default: "false"
++```
++
++## 受保护分支
++
++目标分支要求通过 PR 更新时，设置 `pull-request: "true"`，并通过 `GH_TOKEN` 提供可访问目标仓库的认证。
++运行环境需要安装 GitHub CLI `gh`；GitHub 托管的 Ubuntu runner 已提供。
++Token 至少需要目标仓库的 Contents 读取和 Pull requests 写入权限，SSH 身份需要向仓库创建或更新分支的权限。
++无需给同步身份配置目标分支保护绕过。
++
++```yaml
++- uses: linuxdeepin/action-sync@main
++  env:
++    GH_TOKEN: ${{ steps.app_token.outputs.token }}
++  with:
++    files: repos/linuxdeepin/example.json
++    pull-request: "true"
++    message: "chore: update workflow templates"
+ ```
+ 
++每个目标分支使用固定的 `automation/templates-sync/<目标分支>`，已有开放 PR 会复用。
++这些分支由工具管理，请勿手工编辑；重跑会根据最新目标分支和模板重建提交，使用带预期 SHA 的 `--force-with-lease` 更新。
++如果克隆后远端分支又被修改，推送会失败，需核实后重跑。工具管理的分支不会再次成为模板同步目标。
++没有文件变化时不创建 PR。PR 通过检查和审查、合入目标分支后，模板更新才生效。
++
++`pull-request` 默认关闭，保留直接推送模式。两种模式中的 checkout、push 或 PR API 错误都会使任务失败。
++所有指向同一批仓库的同步任务应共用串行队列，避免同时更新工具分支。
++
++本地测试：`go test ./...`。测试使用本地 Git 仓库和模拟的 PR API，不写入 GitHub。
++
+ ## 例子
+ 
+ ```yaml
+@@ -105,8 +136,8 @@ jobs:
+     "dest": "peeweep-test/test-action/.github/workflows/check.yml",
+     // 可选项，默认同步文件到所有分支
+     "branches": ["main"],
+-    // 可选项，是否从仓库删除文件
+-    "delete": false,
++    // 可选项，非空时只删除列出的文件，不再复制 src
++    "deletelist": [],
+   }
+ ]
+ ```
+@@ -115,4 +146,6 @@ jobs:
+ 
+ 虽然配置可写在任意位置，但为了便于维护，建议以仓库路径为文件名
+ 
++`branches` 使用前缀正则匹配；也兼容旧配置中的 `branch` 数组。两者均未指定时，同步所有非工具管理的分支。
++
+ 例如同步到 peeweep-test/test-action 仓库的配置文件建议放置到 repos/peeweep-test/test-action.json
+diff --git a/action.yml b/action.yml
+index 7d6aa0b..18756ff 100644
+--- a/action.yml
++++ b/action.yml
+@@ -17,6 +17,10 @@ inputs:
+     description: "commit message"
+     required: false
+     default: "chore: Sync by .github"
++  pull-request:
++    description: "Create or update a pull request for each target branch; requires gh authentication"
++    required: false
++    default: "false"
+ 
+ runs:
+   using: "composite"
+@@ -31,5 +35,15 @@ runs:
+         go build
+     - name: Sync
+       shell: bash
++      env:
++        INPUT_FILES: ${{ inputs.files }}
++        INPUT_FILES_FROM: ${{ inputs.files-from }}
++        INPUT_MESSAGE: ${{ inputs.message }}
++        INPUT_PULL_REQUEST: ${{ inputs.pull-request }}
+       run: |
+-        (cat "${{ inputs.files-from }}" || echo "${{ inputs.files }}") | xargs -d ' ' -i sh -c '$GITHUB_ACTION_PATH/action-sync -files="{}" -message="${{ inputs.message }}" || exit 255'
++        set -euo pipefail
++        files="$INPUT_FILES"
++        if [ -f "$INPUT_FILES_FROM" ]; then
++          files="$(cat "$INPUT_FILES_FROM")"
++        fi
++        "$GITHUB_ACTION_PATH/action-sync" -files="$files" -message="$INPUT_MESSAGE" -pull-request="$INPUT_PULL_REQUEST"
+diff --git a/main.go b/main.go
+index d7166a3..effe7d4 100644
+--- a/main.go
++++ b/main.go
+@@ -3,6 +3,7 @@ package main
+ import (
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"flag"
+ 	"fmt"
+ 	"log"
+@@ -13,11 +14,14 @@ import (
+ 	"strings"
+ )
+ 
++const pullRequestBranchPrefix = "automation/templates-sync/"
++
+ type Config struct {
+ 	Src        string   `json:"src"`
+ 	Dest       string   `json:"dest"`
+ 	DeleteList []string `json:"deletelist"`
+ 	Branches   []string `json:"branches"`
++	Branch     []string `json:"branch"`
+ }
+ type Branch struct {
+ 	Owner  string
+@@ -28,10 +32,11 @@ type Branch struct {
+ 
+ func main() {
+ 	var files, message string
+-	var dryRun bool
++	var dryRun, pullRequest bool
+ 	flag.StringVar(&message, "message", "chore: Sync by .github", "commit message")
+ 	flag.StringVar(&files, "files", "", "config files, separated by spaces")
+ 	flag.BoolVar(&dryRun, "dryRun", false, "dry run")
++	flag.BoolVar(&pullRequest, "pull-request", false, "publish template updates through pull requests")
+ 	flag.Parse()
+ 
+ 	if files == "" {
+@@ -63,6 +68,9 @@ func main() {
+ 		changedBranches := make(map[string]map[string]bool)
+ 
+ 		for _, config := range configs {
++			if len(config.Branches) == 0 {
++				config.Branches = config.Branch
++			}
+ 			owner, repo, path, err := split(config.Dest)
+ 			if err != nil {
+ 				log.Fatal(err)
+@@ -91,6 +99,9 @@ func main() {
+ 					continue
+ 				}
+ 				branch := strings.TrimPrefix(line, "origin/")
++				if strings.HasPrefix(branch, pullRequestBranchPrefix) {
++					continue
++				}
+ 				branches = append(branches, branch)
+ 			}
+ 			var syncBranches []string
+@@ -117,7 +128,7 @@ func main() {
+ 				out, err = execCommand(ctx, workdir, "git", "checkout", branch)
+ 				if err != nil {
+ 					logError("err: %v output: %s", err, string(out))
+-					continue
++					os.Exit(1)
+ 				}
+ 				// 删除文件， 如果有delete_list配置，就不再进行同步
+ 				if len(config.DeleteList) > 0 {
+@@ -167,9 +178,15 @@ func main() {
+ 		// 提交所有变动的仓库分支
+ 		for workdir := range changedBranches {
+ 			for branch := range changedBranches[workdir] {
+-				out, err := execCommand(ctx, workdir, "git", "push", "origin", branch)
++				var err error
++				if pullRequest {
++					err = syncPullRequest(ctx, workdir, branch, message)
++				} else {
++					_, err = execCommand(ctx, workdir, "git", "push", "origin", branch)
++				}
+ 				if err != nil {
+-					logError("err: %v output: %s", err, string(out))
++					logError("err: %v", err)
++					os.Exit(1)
+ 				}
+ 			}
+ 		}
+@@ -181,6 +198,35 @@ func main() {
+ 	}
+ }
+ 
++func syncPullRequest(ctx context.Context, workdir, base, message string) error {
++	repo := filepath.Base(filepath.Dir(workdir)) + "/" + filepath.Base(workdir)
++	branch := pullRequestBranchPrefix + base
++	url, err := execCommand(ctx, workdir, "gh", "pr", "list", "--repo", repo,
++		"--head", branch, "--base", base, "--state", "open", "--json", "url", "--jq", ".[0].url // empty")
++	if err != nil {
++		return err
++	}
++	previous, err := execCommand(ctx, workdir, "git", "rev-parse", "--verify", "-q", "refs/remotes/origin/"+branch)
++	var exitError *exec.ExitError
++	if err != nil && (!errors.As(err, &exitError) || exitError.ExitCode() != 1) {
++		return err
++	}
++	// Only the tool-owned PR branch may be replaced, using the clone's expected head.
++	lease := "--force-with-lease=refs/heads/" + branch + ":" + strings.TrimSpace(string(previous))
++	if _, err := execCommand(ctx, workdir, "git", "push", lease, "origin", base+":refs/heads/"+branch); err != nil {
++		return err
++	}
++	if len(strings.TrimSpace(string(url))) == 0 {
++		url, err = execCommand(ctx, workdir, "gh", "pr", "create", "--repo", repo,
++			"--head", branch, "--base", base, "--title", "chore: sync workflow templates", "--body", message)
++		if err != nil {
++			return err
++		}
++	}
++	log.Printf("Pull request: %s", strings.TrimSpace(string(url)))
++	return nil
++}
++
+ func logError(format string, args ...interface{}) {
+ 	msg := fmt.Sprintf(format, args...)
+ 	fmt.Printf("::error::%s\n", msg)

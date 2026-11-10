@@ -1,0 +1,7 @@
+{
+  "sources/sync-baseline.yml": "9e09bbc5b6be7f0db14578f9052996b452f2e39502f8c55f940692b7c305893a",
+  "sources/verify-group-version.yml": "a2729d829da7b5260b39cf7f555ed3a0fdef5b9391064307b871dae98d1db23a",
+  "sources/action-sync-main.go": "103c8a3c06513a1d838e1cd3ba0c024c2ef9ed3613c3261486b49d25bee9b5ea",
+  "sources/action-sync-action.yml": "3cf42162aa89c289081cddd41ec7e76989db97944ec664705850655225e9cbbb",
+  "sources/action-sync-main_test.go": "432015df5811ee5509f8f3cf836363071403bb2f8c9e141c6f81bd9e3bde099a"
+}

@@ -1,0 +1,219 @@
+diff --git a/.github/tests/test_verify_group_version.py b/.github/tests/test_verify_group_version.py
+index 5714cfc..6ec5fcf 100644
+--- a/.github/tests/test_verify_group_version.py
++++ b/.github/tests/test_verify_group_version.py
+@@ -294,7 +294,8 @@ class VerifyGroupVersionTests(unittest.TestCase):
+                            'TEST_GH_LOG': str(log), 'VERIFY_OUTCOME': outcome,
+                            'GITHUB_REPOSITORY': self.repo, 'PR_HEAD_SHA': 'member-head',
+                            'GITHUB_SERVER_URL': 'https://github.com', 'GITHUB_RUN_ID': '1'}
+-                    subprocess.run(['bash', '-e', '-c', step['run']], env=env, check=True)
++                    result = subprocess.run(['bash', '-e', '-c', step['run']], env=env)
++                    self.assertEqual(result.returncode, 0 if outcome == 'success' else 1)
+                     args = json.loads(log.read_text())
+                     self.assertEqual(args[1], 'repos/linuxdeepin/go-lib/statuses/member-head')
+                     self.assertIn('state=' + ('success' if outcome == 'success' else 'failure'), args)
+@@ -319,6 +320,45 @@ class VerifyGroupVersionTests(unittest.TestCase):
+                     self.ns['main']()
+         self.calls.append(f'repos/{self.repo}/commits/member-head/pulls?per_page=100')
+ 
++    def test_final_refresh_failure_publishes_failure_and_fails_the_step(self):
++        step = WORKFLOW['jobs']['verify']['steps'][-1]
++        with tempfile.TemporaryDirectory() as directory:
++            gh = Path(directory) / 'gh'
++            log = Path(directory) / 'calls.jsonl'
++            gh.write_text('''#!/usr/bin/env python3
++import json, os, pathlib, sys
++args = sys.argv[1:]
++with pathlib.Path(os.environ['TEST_GH_LOG']).open('a') as output:
++    output.write(json.dumps(args) + '\\n')
++if args[0] == 'api' and '/pulls?' in args[1]:
++    if os.environ['FAIL_REFRESH'] == 'list':
++        print(os.environ['PARTIAL_OUTPUT'], end='')
++        print('gh: HTTP 503', file=sys.stderr)
++        sys.exit(1)
++    print('1')
++elif args[:2] == ['pr', 'view']:
++    print('gh: HTTP 503', file=sys.stderr)
++    sys.exit(1)
++''')
++            gh.chmod(0o755)
++            for phase, partial in [('list', ''), ('list', '1\n'), ('pr', '')]:
++                with self.subTest(phase=phase, partial=partial):
++                    log.write_text('')
++                    env = {**os.environ, 'PATH': directory + os.pathsep + os.environ['PATH'],
++                           'TEST_GH_LOG': str(log), 'VERIFY_OUTCOME': 'success',
++                           'GITHUB_REPOSITORY': self.repo, 'PR_HEAD_SHA': 'member-head',
++                           'GITHUB_SERVER_URL': 'https://github.com', 'GITHUB_RUN_ID': '1',
++                           'FAIL_REFRESH': phase, 'PARTIAL_OUTPUT': partial}
++                    result = subprocess.run(['bash', '-e', '-c', step['run']], env=env,
++                                            capture_output=True, text=True)
++                    self.assertNotEqual(result.returncode, 0)
++                    calls = [json.loads(line) for line in log.read_text().splitlines()]
++                    self.assertEqual(calls[-1][1], f'repos/{self.repo}/statuses/member-head')
++                    self.assertIn('state=failure', calls[-1])
++                    self.assertFalse(any('state=success' in call for call in calls))
++                    if phase == 'list':
++                        self.assertFalse(any(call[:2] == ['pr', 'view'] for call in calls))
++
+     def test_shared_sha_status_is_failure_when_any_open_pr_is_closed(self):
+         step = WORKFLOW['jobs']['verify']['steps'][-1]
+         with tempfile.TemporaryDirectory() as directory:
+@@ -336,7 +376,8 @@ class VerifyGroupVersionTests(unittest.TestCase):
+                    'GITHUB_REPOSITORY': self.repo, 'PR_HEAD_SHA': 'member-head',
+                    'GITHUB_SERVER_URL': 'https://github.com', 'GITHUB_RUN_ID': '1',
+                    'REVIEW_PR_STATE': 'closed'}
+-            subprocess.run(['bash', '-e', '-c', step['run']], env=env, check=True)
++            result = subprocess.run(['bash', '-e', '-c', step['run']], env=env)
++            self.assertNotEqual(result.returncode, 0)
+             args = json.loads(log.read_text())
+             self.assertIn('state=failure', args)
+ 
+diff --git a/.github/workflows/templates-sync.yml b/.github/workflows/templates-sync.yml
+index 9c0aaea..9553f93 100644
+--- a/.github/workflows/templates-sync.yml
++++ b/.github/workflows/templates-sync.yml
+@@ -9,7 +9,8 @@ on:
+ 
+ concurrency:
+   group: ${{ github.workflow }}-${{ github.ref }}
+-  cancel-in-progress: true
++  cancel-in-progress: false
++  queue: max
+ 
+ jobs:
+   templates-sync:
+@@ -39,6 +40,16 @@ jobs:
+             workflow-templates/*.yml
+             .github/workflows/templates-sync.yml
+ 
++      - name: Create GitHub App token for template PRs
++        id: app_token
++        uses: actions/create-github-app-token@v3
++        with:
++          app-id: ${{ secrets.APP_ID }}
++          private-key: ${{ secrets.APP_PRIVATE_KEY }}
++          owner: ${{ github.repository_owner }}
++          permission-contents: read
++          permission-pull-requests: write
++
+       # Install ssh key and known_hosts
+       - name: Git config
+         env:
+@@ -54,9 +65,12 @@ jobs:
+ 
+       - name: Sync changed configs
+         uses: linuxdeepin/action-sync@main
+-        if: steps.changed-configs.outputs.any_changed == 'true'
++        if: steps.changed-configs.outputs.any_changed == 'true' && steps.changed-files.outputs.any_changed != 'true' && github.event_name != 'workflow_dispatch'
++        env:
++          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+         with:
+           files: "${{ steps.changed-configs.outputs.all_changed_files }}"
++          pull-request: "true"
+           message: |
+             chore: Sync by ${{ github.event.head_commit.url }}
+ 
+@@ -75,8 +89,11 @@ jobs:
+       - name: Sync all files
+         uses: linuxdeepin/action-sync@main
+         if: steps.changed-files.outputs.any_changed == 'true' || github.event_name == 'workflow_dispatch'
++        env:
++          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+         with:
+           files: "${{ steps.all-configs.outputs.ALL_CONFIGS }}"
++          pull-request: "true"
+           message: |
+             chore: Sync by ${{ github.event.head_commit.url }}
+ 
+diff --git a/.github/workflows/verify-group-version.yml b/.github/workflows/verify-group-version.yml
+index c4f363c..dc98687 100644
+--- a/.github/workflows/verify-group-version.yml
++++ b/.github/workflows/verify-group-version.yml
+@@ -158,14 +158,23 @@ jobs:
+         env:
+           VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+         run: |
++          set -euo pipefail
+           current_state=success
+           if [ "$VERIFY_OUTCOME" != "success" ]; then
+             current_state=failure
+           fi
+-          for number in $(gh api "repos/$GITHUB_REPOSITORY/commits/$PR_HEAD_SHA/pulls?per_page=100" \
+-              --jq ".[] | select(.state == \"open\" and .head.sha == \"$PR_HEAD_SHA\") | .number"); do
+-            state="$(gh pr view "$number" -R "$GITHUB_REPOSITORY" --json state --jq .state | tr '[:upper:]' '[:lower:]')"
+-            if [ "$state" != "open" ]; then
++          if ! numbers="$(gh api "repos/$GITHUB_REPOSITORY/commits/$PR_HEAD_SHA/pulls?per_page=100" \
++              --jq ".[] | select(.state == \"open\" and .head.sha == \"$PR_HEAD_SHA\") | .number")"; then
++            echo '::error::无法刷新关联 PR，成员版本校验不能通过' >&2
++            current_state=failure
++            numbers=
++          fi
++          for number in $numbers; do
++            if ! state="$(gh pr view "$number" -R "$GITHUB_REPOSITORY" --json state --jq .state | tr '[:upper:]' '[:lower:]')"; then
++              echo "::error::无法刷新 PR #$number，成员版本校验不能通过" >&2
++              current_state=failure
++              break
++            elif [ "$state" != "open" ]; then
+               current_state=failure
+             fi
+           done
+@@ -180,3 +189,4 @@ jobs:
+             -f state="$state" -f context=group-version-guard \
+             -f description="$description" \
+             -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > /dev/null
++          test "$current_state" = success
+diff --git a/README.md b/README.md
+index 754f6a4..0ac90b7 100644
+--- a/README.md
++++ b/README.md
+@@ -4,7 +4,17 @@ The github tools
+ 
+ ## 同步模板文件
+ 
+-同步模板文件到组织的所有仓库中, 可以修改 repos 目录下的配置文件, [文档](https://github.com/linuxdeepin/action-sync)
++修改 [repos](./repos) 下的配置或 [workflow-templates](./workflow-templates) 中的模板，会触发
++[Workflow templates sync](./.github/workflows/templates-sync.yml)。它使用 [action-sync](https://github.com/linuxdeepin/action-sync)
++的 `pull-request` 模式，为各目标分支创建或更新模板 PR；审查并合并 PR 后，模板才生效。
++
++先合入 `action-sync` 的 PR 模式和失败退出修复，再启用本工作流。同步继续通过 `SYNC_SSH_KEY`
++推送专用分支，通过组织 `APP_ID`、`APP_PRIVATE_KEY` 生成 Token 创建 PR。
++该 App 必须安装到本次配置涉及的所有仓库，并具备 Contents 读取及 Pull requests 写入权限；完整同步不只涉及 35 个 DDE 成员。
++SSH 身份须能创建和更新专用分支，不授予目标分支保护绕过。
++
++`automation/templates-sync/<目标分支>` 由同步工具管理，重跑会按最新模板和目标分支更新它，请勿在其上手工修改。
++同步任务串行排队；推送或 PR API 失败会使任务失败。绿色只说明 PR 已生成或模板无变化，安装完成仍需读回目标分支确认。
+ 
+ ## 开关仓库功能
+ 
+@@ -54,14 +64,14 @@ cpp代码静态检查
+ `GITHUB_TOKEN` 把 `group-version-guard` 状态写到 PR 的 head 提交，不需要 GitHub App Secret。
+ 
+ `repos/linuxdeepin/*.json` 已为 35 个组成员配置此模板。dtk6log 已归档，其模板同步配置停用。
+-上线前先完成 DDE 发布协调器和
+-成员首用准备，包括 go-lib 的发布入口，再合入本工作流及模板配置。带 epoch 的新发布须等协调器与成员校验均更新后触发。
++上线前先完成成员首用准备，包括 go-lib 的发布入口；先合入 `action-sync` 修复，再合入本工作流和模板配置，
++合并成员模板 PR 后上线 DDE 协调器。带 epoch 的新发布须等协调器与成员校验均更新后触发。
+ 默认分支上的入口文件接入后，给所有成员发布目标分支
+ 启用 `group-version-guard` 必需检查，来源选择 GitHub Actions；同时要求 PR、分支保持最新，
+ 禁止直接推送、强推和绕过。工作流本身不能阻止未受保护分支上的直接推送。
+ 
+-现有模板同步通过 SSH 直接推送。成员启用上述保护后，后续模板更新需要通过 PR 合入，
+-不可给模板同步或发布机器人设置绕过来继续直接推送。
++模板同步和发布机器人均通过 PR 更新成员目标分支，不配置保护绕过。
++最终关联 PR 列表或 PR 状态查询失败时，guard 发布失败状态，工作流同时失败；不会沿用之前的成功结果。
+ 
+ 本地验证：`python3 -I -B .github/tests/test_verify_group_version.py -v`。
+ changelog 与玲珑版本验证：`python3 -I -B .github/tests/test_update_changelog.py -v`，需安装 devscripts。
+diff --git a/repos/linuxdeepin/deepin-voice-note.json b/repos/linuxdeepin/deepin-voice-note.json
+index 9471905..4753cf2 100644
+--- a/repos/linuxdeepin/deepin-voice-note.json
++++ b/repos/linuxdeepin/deepin-voice-note.json
+@@ -50,7 +50,7 @@
+   {
+     "branch": [
+       "master",
+-      "develop[/.+",
++      "develop/.+",
+       "maintain/.+"
+     ],
+     "src": "workflow-templates/call-clacheck.yml",

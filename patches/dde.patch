@@ -1,0 +1,80 @@
+diff --git a/.github/tests/test_group_release.py b/.github/tests/test_group_release.py
+index 3ab7d2e..b2b408f 100644
+--- a/.github/tests/test_group_release.py
++++ b/.github/tests/test_group_release.py
+@@ -1232,6 +1232,16 @@ class GroupReleaseTests(unittest.TestCase):
+         self.assertNotIn('${{', release['jobs']['dispatch']['steps'][-1]['run'])
+         self.assertNotIn('actions/checkout', str(WORKFLOW))
+ 
++    def test_all_baseline_entry_points_share_a_queue_without_replacing_pending_prs(self):
++        concurrency = WORKFLOW['jobs']['coordinate']['concurrency']
++        self.assertEqual(concurrency['group'], 'baseline-controller')
++        self.assertFalse(concurrency['cancel-in-progress'])
++        self.assertEqual(concurrency['queue'], 'max')
++        release = yaml.safe_load((ROOT / '.github/workflows/release-group.yml').read_text())
++        self.assertNotEqual(release['concurrency']['group'], concurrency['group'])
++        self.assertFalse(release['concurrency']['cancel-in-progress'])
++        self.assertEqual(release['concurrency']['queue'], 'max')
++
+     def test_app_token_is_created_before_api_calls_in_each_job(self):
+         release = yaml.safe_load((ROOT / '.github/workflows/release-group.yml').read_text())
+         declared = WORKFLOW.get('on', WORKFLOW.get(True))['workflow_call']['secrets']
+diff --git a/.github/workflows/release-group.yml b/.github/workflows/release-group.yml
+index 4d3af94..b2f458f 100644
+--- a/.github/workflows/release-group.yml
++++ b/.github/workflows/release-group.yml
+@@ -47,6 +47,7 @@ permissions:
+ concurrency:
+   group: release-group-${{ inputs.group }}
+   cancel-in-progress: false
++  queue: max
+ 
+ jobs:
+   plan:
+diff --git a/.github/workflows/sync-baseline.yml b/.github/workflows/sync-baseline.yml
+index ceda46e..4e24606 100644
+--- a/.github/workflows/sync-baseline.yml
++++ b/.github/workflows/sync-baseline.yml
+@@ -45,8 +45,10 @@ jobs:
+     name: Coordinate group release
+     runs-on: ubuntu-latest
+     concurrency:
+-      group: baseline-controller-${{ inputs.group || github.event.pull_request.number || 'sync' }}
++      # 定时、PR 和手动入口都可能更新同一个基线状态。
++      group: baseline-controller
+       cancel-in-progress: false
++      queue: max
+     outputs:
+       repos: ${{ steps.coordinate.outputs.repos }}
+     steps:
+diff --git a/README.md b/README.md
+index a6bcbb3..0ab0538 100644
+--- a/README.md
++++ b/README.md
+@@ -74,6 +74,10 @@ G1 的 Auto Release 支持 `name` / `email`，使用默认分支及原有发布
+ 尚未创建的会标注“尚无发布 PR”。
+ 自动链接区块之外的人工说明会保留。
+ 
++定时同步、PR 检查和手动发布的协调步骤共用一个串行队列，每次开始执行后重新读取当前状态。
++队列最多保留 100 个等待任务，避免旧检查晚于新检查写回结果，也避免新事件替换其他 PR 的等待任务。
++超过 GitHub 队列上限而被取消的任务需要重跑。成员工作流的派发仍可并行。
++
+ 触发步骤成功只说明 GitHub 已接受请求，发布进度以成员运行结果和基线 PR 的检查状态为准。
+ 某个成员触发失败时，其他成员仍会继续，整次 `Release group` 运行会标为失败。
+ 
+@@ -140,10 +144,12 @@ python3 -I .github/tests/test_group_release.py -v
+ 
+ 成员检查名为 **`group-version-guard`**，来源为 GitHub Actions，不需要新增 App Secret。
+ 给各成员发布目标分支启用此必需检查，并要求通过 PR 合入、保持分支最新、禁止直接推送或绕过。
+-这也适用于显式选择的 `base_branch`。现有模板同步采用直接推送，启用保护后后续模板更新须通过 PR 合入。
++这也适用于显式选择的 `base_branch`。模板同步使用 `action-sync` 的 `pull-request` 模式，
++在专用分支更新模板并创建或复用 PR，经检查和审查后合入成员目标分支。
+ 
+-部署前先完成上述首用准备及本仓库发布协调器的上线，再在共享仓库合入校验工作流和模板配置，
+-待成员入口接入并验证检查后启用保护。测试 fork 会自动读取同组织的 `dde` 发布记录。
++部署前先完成上述首用准备，并合入 `action-sync` 的 PR 模式及失败退出修复；
++然后合入共享校验工作流和模板配置，审查并合并各成员的模板 PR，再上线本仓库协调器。
++验证两种检查均能运行且来源正确后，逐组启用保护。测试 fork 会自动读取同组织的 `dde` 发布记录。
+ go-lib 的发布入口须先合入其默认分支。dde-clipboard 保留原包名与 epoch；带 epoch 的新一轮发布须等
+ 协调器与成员校验工作流均更新后再触发。
+ 
