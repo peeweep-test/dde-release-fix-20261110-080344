@@ -225,7 +225,8 @@ def template_sync():
                 assert recorded == numbers, (recorded, numbers)
             recorded = numbers
             for base, p in current.items():
-                text = base64.b64decode(api(f'repos/{REPO}/contents/.github/workflows/review-sync-marker.yml?ref={p["head"]["sha"]}')['content']).decode()
+                head = api(f'repos/{REPO}/git/ref/heads/{p["head"]["ref"]}')['object']['sha']
+                text = base64.b64decode(api(f'repos/{REPO}/contents/.github/workflows/review-sync-marker.yml?ref={head}')['content']).decode()
                 assert f'revision {revision}' in text, text
             summary('Template PRs: ' + ', '.join(p['html_url'] for p in current.values()))
     after = {b: api(f'repos/{REPO}/git/ref/heads/{b}')['object']['sha'] for b in branches}
